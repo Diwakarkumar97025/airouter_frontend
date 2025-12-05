@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react'
 import './App.css'
 
+const CHAT_API_URL = 'http://localhost:8000/chat'
+
 function App() {
   const [messages, setMessages] = useState([
     {
@@ -44,18 +46,19 @@ function App() {
 
     let assistantReply = ''
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch(CHAT_API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ message: trimmed }),
+        body: JSON.stringify({ query: trimmed }),
       })
 
       if (!res.ok) throw new Error('Request failed')
 
       const data = await res.json()
       assistantReply =
+        data?.response ||
         data?.reply ||
         data?.message ||
         "I'm here, but your backend didn't send a reply field."
