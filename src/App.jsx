@@ -9,6 +9,121 @@ import anthropicIcon from './assets/icons/anthropic.png'
 // CONFIGURABLE API URL
 const API_BASE_URL = 'http://localhost:8000'
 
+// Add this helper function before the App component
+const CodeBlock = ({ code, language }) => {
+  const [copied, setCopied] = useState(false)
+  
+  const copyToClipboard = () => {
+    navigator.clipboard.writeText(code)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+  
+  return (
+    <div className="code-block-container">
+      <div className="code-block-header">
+        <span className="code-language">{language || 'code'}</span>
+        <button className="copy-code-btn" onClick={copyToClipboard}>
+          {copied ? '✓ Copied' : 'Copy'}
+        </button>
+      </div>
+      <pre className="code-block-content">
+        <code>{code}</code>
+      </pre>
+    </div>
+  )
+}
+
+// Add this function to parse messages with code blocks
+const parseMessageContent = (content, codeBlocks = []) => {
+  if (!codeBlocks || codeBlocks.length === 0) {
+    // Fallback: Try to parse markdown code blocks from content if no API code_blocks
+    const markdownCodeBlockRegex = /```(\w+)?\n?([\s\S]*?)```/g
+    const parts = []
+    let lastIndex = 0
+    let match
+    let foundCodeBlock = false
+    
+    while ((match = markdownCodeBlockRegex.exec(content)) !== null) {
+      foundCodeBlock = true
+      const language = match[1] || 'code'
+      const code = match[2].trim()
+      const matchStart = match.index
+      const matchEnd = match.index + match[0].length
+      
+      // Add text before code block
+      if (matchStart > lastIndex) {
+        const textContent = content.substring(lastIndex, matchStart).trim()
+        if (textContent) {
+          parts.push({ type: 'text', content: textContent })
+        }
+      }
+      
+      // Add code block
+      parts.push({
+        type: 'code',
+        code: code,
+        language: language
+      })
+      
+      lastIndex = matchEnd
+    }
+    
+    // Add remaining text
+    if (lastIndex < content.length) {
+      const textContent = content.substring(lastIndex).trim()
+      if (textContent) {
+        parts.push({ type: 'text', content: textContent })
+      }
+    }
+    
+    return foundCodeBlock && parts.length > 0 ? parts : [{ type: 'text', content }]
+  }
+  
+  // Use code_blocks from API - works for ALL languages generically
+  const sortedBlocks = [...codeBlocks].sort((a, b) => (a.start_pos || 0) - (b.start_pos || 0))
+  const parts = []
+  let lastIndex = 0
+  
+  sortedBlocks.forEach((block) => {
+    const startPos = block.start_pos || 0
+    const endPos = block.end_pos || content.length
+    
+    // Add text before code block
+    if (startPos > lastIndex) {
+      const textContent = content.substring(lastIndex, startPos).trim()
+      // Remove markdown code block markers if present
+      const cleanedText = textContent.replace(/```[\w]*\n?/g, '').replace(/```/g, '').trim()
+      if (cleanedText) {
+        parts.push({ type: 'text', content: cleanedText })
+      }
+    }
+    
+    // Add code block - works for ANY language (sql, python, javascript, etc.)
+    if (block.code) {
+      parts.push({
+        type: 'code',
+        code: block.code,
+        language: block.language || block.raw_language || 'code' // Generic - works for all languages
+      })
+    }
+    
+    lastIndex = endPos
+  })
+  
+  // Add remaining text after last code block
+  if (lastIndex < content.length) {
+    const textContent = content.substring(lastIndex).trim()
+    // Remove markdown code block markers if present
+    const cleanedText = textContent.replace(/```[\w]*\n?/g, '').replace(/```/g, '').trim()
+    if (cleanedText) {
+      parts.push({ type: 'text', content: cleanedText })
+    }
+  }
+  
+  return parts.length > 0 ? parts : [{ type: 'text', content }]
+}
+
 function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
@@ -32,6 +147,11 @@ function App() {
   const [messageActions, setMessageActions] = useState({}) // Track actions per message
   const [regenerateCounts, setRegenerateCounts] = useState({}) // Track regenerate count per message
   const [lastModelUsed, setLastModelUsed] = useState({}) // Track last model used per message
+  const [billingInfo, setBillingInfo] = useState(null)
+  const [subscriptionPlans, setSubscriptionPlans] = useState([])
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false)
+  const [selectedPlanForUpgrade, setSelectedPlanForUpgrade] = useState(null)
+  const [codeBlocksCache, setCodeBlocksCache] = useState({}) // message_id -> code_blocks
   
   const abortControllerRef = useRef(null)
   const textareaRef = useRef(null)
@@ -172,8 +292,14 @@ function App() {
       
       if (res.ok) {
         const data = await res.json()
-        setSessions(data || [])
-        return data
+        // API returns sessions with 'title' field, map it to both 'title' and 'summary' for compatibility
+        const sessionsWithTitle = (data || []).map(session => ({
+          ...session,
+          summary: session.title || session.summary, // Use title from API, fallback to summary if exists
+          title: session.title || session.summary
+        }))
+        setSessions(sessionsWithTitle)
+        return sessionsWithTitle
       }
     } catch (err) {
       console.error('Failed to load sessions:', err)
@@ -268,63 +394,42 @@ function App() {
         const responseData = await res.json()
         setCurrentSessionId(sessionId)
         
-        // Extract title from the API response
-        // Based on your API: { session_id, role, content, answered_by_model, title }
-        let title = null
+        // Extract messages from response
         let messages = []
         
-        // Handle different response structures
         if (Array.isArray(responseData)) {
-          // If response is array of messages
           messages = responseData
-          // Check if first message has title
-          if (responseData.length > 0 && responseData[0].title) {
-            title = responseData[0].title
-          }
-        } else if (responseData.title) {
-          // If response has title at root level (single message object)
-          title = responseData.title
-          // If it's a single message object, convert to array
-          if (responseData.content) {
-            messages = [{
-              id: responseData.id || Date.now(),
-              role: responseData.role || 'assistant',
-              content: responseData.content
-            }]
-          } else {
-            messages = responseData.messages || []
-          }
+        } else if (responseData.content) {
+          messages = [{
+            id: responseData.id,
+            role: responseData.role || 'assistant',
+            content: responseData.content,
+            code_blocks: responseData.code_blocks || []
+          }]
         } else if (responseData.messages && Array.isArray(responseData.messages)) {
-          // If response is object with messages array
           messages = responseData.messages
-          title = responseData.title || responseData.summary
         } else {
-          // Fallback: assume it's messages array
           messages = Array.isArray(responseData) ? responseData : []
         }
         
-        // Check if current session title is "New conversation" and update if title exists
-        const sessionInfo = sessions.find(s => s.session_id === sessionId)
-        const currentTitle = sessionInfo?.summary || sessionInfo?.title || 'New conversation'
-        
-        // Only update if current title is "New conversation" and API has a different title
-        if (currentTitle === 'New conversation' && 
-            title && 
-            title !== 'New conversation') {
-          console.log('Updating title from API response:', title)
-          const updated = await updateChatTitle(sessionId, title)
-          if (updated) {
-            // Reload sessions to update the UI immediately
-            await loadSessions(user.id, token)
+        // Format messages and merge code_blocks from cache
+        const formattedMessages = messages.map(msg => {
+          const dbId = msg.id
+          
+          if (!dbId) {
+            console.warn('Message missing database ID:', msg)
           }
-        }
-        
-        // Format messages for display
-        const formattedMessages = messages.map(msg => ({
-          id: msg.id || Date.now() + Math.random(),
-          role: msg.role,
-          content: msg.content
-        }))
+          
+          // Merge code_blocks from cache if available (from message response)
+          const cachedCodeBlocks = codeBlocksCache[dbId]
+          
+          return {
+            id: dbId,
+            role: msg.role,
+            content: msg.content,
+            code_blocks: cachedCodeBlocks || msg.code_blocks || []
+          }
+        })
         
         setMessages(formattedMessages)
       }
@@ -418,23 +523,17 @@ function App() {
 
       const data = await res.json()
       
-      // Check if title was returned and update
-      if (data.title) {
-        console.log('Received title from response:', data.title)
-        const updated = await updateChatTitle(currentSessionId, data.title)
-        if (updated) {
-          console.log('Title updated successfully, stopping any polling')
-          if (titlePollInterval.current) {
-            clearInterval(titlePollInterval.current)
-          }
-        }
+      // Store code_blocks in cache using message_id from response
+      if (data.message_id && data.code_blocks && data.code_blocks.length > 0) {
+        setCodeBlocksCache(prev => ({
+          ...prev,
+          [data.message_id]: data.code_blocks
+        }))
       }
       
       // Reload the full session to get all messages from backend
       await loadSession(currentSessionId)
       
-      // Reload sessions list to update sidebar
-      await loadSessions(user.id, token)
     } catch (err) {
       if (err.name !== 'AbortError') {
         console.error('Chat error:', err)
@@ -527,7 +626,15 @@ function App() {
       return
     }
     
-    await updateChatTitle(sessionId, newTitle)
+    // This is the ONLY POST call for title update - when user clicks Rename
+    const token = localStorage.getItem('access_token')
+    const updated = await updateChatTitle(sessionId, newTitle)
+    
+    if (updated && user) {
+      // Reload sessions to get updated title from API
+      await loadSessions(user.id, token)
+    }
+    
     setRenamingSession(null)
     setRenameValue('')
     setShowContextMenu(null)
@@ -536,7 +643,7 @@ function App() {
   const fetchAnalytics = async () => {
     const token = localStorage.getItem('access_token')
     try {
-      const res = await fetch(`${API_BASE_URL}/api/model_requests`, {
+      const res = await fetch(`${API_BASE_URL}/api/user/model_usage`, {
         headers: { 'Authorization': `Bearer ${token}` }
       })
       
@@ -669,14 +776,99 @@ function App() {
     }
   }
 
-  const handleThumbsUp = (messageId) => {
+  const handleThumbsUp = async (messageId, sessionId) => {
     setMessageActions(prev => ({ ...prev, [messageId]: 'liked' }))
-    console.log('Message liked:', messageId)
+    
+    // Fire and forget - send feedback to backend
+    const token = localStorage.getItem('access_token')
+    try {
+      // messageId should be the database ID from the API response
+      // Validate it's a valid integer (database ID)
+      let messageIdInt
+      
+      if (typeof messageId === 'number') {
+        // If it's a number, check if it's a reasonable database ID (not a timestamp)
+        // Database IDs are typically small integers, timestamps are large numbers
+        if (messageId > 1000000000000) {
+          // This looks like a timestamp (Date.now()), not a database ID
+          console.error('Invalid message_id: appears to be a timestamp, not database ID:', messageId)
+          return
+        }
+        messageIdInt = Math.floor(messageId)
+      } else if (typeof messageId === 'string') {
+        messageIdInt = parseInt(messageId, 10)
+      } else {
+        messageIdInt = parseInt(String(messageId), 10)
+      }
+      
+      // Ensure it's a valid integer and reasonable database ID
+      if (isNaN(messageIdInt) || messageIdInt <= 0 || messageIdInt > 1000000000000) {
+        console.error('Invalid message_id for feedback:', messageId, 'Expected database ID')
+        return
+      }
+      
+      await fetch(`${API_BASE_URL}/api/feedback`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          message_id: messageIdInt,
+          session_id: sessionId || currentSessionId,
+          feedback_type: 'like'
+        })
+      })
+    } catch (err) {
+      console.error('Failed to send feedback:', err)
+      // Don't revert UI - fire and forget
+    }
   }
 
-  const handleThumbsDown = (messageId) => {
+  const handleThumbsDown = async (messageId, sessionId) => {
     setMessageActions(prev => ({ ...prev, [messageId]: 'disliked' }))
-    console.log('Message disliked:', messageId)
+    
+    // Fire and forget - send feedback to backend
+    const token = localStorage.getItem('access_token')
+    try {
+      // messageId should be the database ID from the API response
+      let messageIdInt
+      
+      if (typeof messageId === 'number') {
+        // Check if it's a reasonable database ID (not a timestamp)
+        if (messageId > 1000000000000) {
+          console.error('Invalid message_id: appears to be a timestamp, not database ID:', messageId)
+          return
+        }
+        messageIdInt = Math.floor(messageId)
+      } else if (typeof messageId === 'string') {
+        messageIdInt = parseInt(messageId, 10)
+      } else {
+        messageIdInt = parseInt(String(messageId), 10)
+      }
+      
+      // Ensure it's a valid integer and reasonable database ID
+      if (isNaN(messageIdInt) || messageIdInt <= 0 || messageIdInt > 1000000000000) {
+        console.error('Invalid message_id for feedback:', messageId, 'Expected database ID')
+        return
+      }
+      
+      await fetch(`${API_BASE_URL}/api/feedback`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          message_id: messageIdInt,
+          session_id: sessionId || currentSessionId,
+          feedback_type: 'dislike'
+        })
+      })
+    } catch (err) {
+      console.error('Failed to send feedback:', err)
+      // Don't revert UI - fire and forget
+    }
   }
 
   const handleSessionExpiredClose = () => {
@@ -791,7 +983,7 @@ function App() {
   )
 
   const SettingsModal = () => {
-    const maxRequests = Math.max(...analyticsData.map(d => d.request_count || 0), 1)
+    const maxRequests = Math.max(...analyticsData.map(d => d.request_number || 0), 1)
     const yAxisMax = Math.ceil(maxRequests / 10) * 10 || 10
     
     return (
@@ -813,6 +1005,12 @@ function App() {
               onClick={() => { setSettingsTab('analytics'); fetchAnalytics(); }}
             >
               Analytics
+            </button>
+            <button 
+              className={`settings-tab ${settingsTab === 'billing' ? 'active' : ''}`}
+              onClick={() => { setSettingsTab('billing'); fetchBillingInfo(); }}
+            >
+              Billing & Subscription
             </button>
           </div>
           <div className="settings-body">
@@ -853,7 +1051,7 @@ function App() {
                 </div>
                 <button className="logout-btn" onClick={handleLogout}>Logout</button>
               </div>
-            ) : (
+            ) : settingsTab === 'analytics' ? (
               <div className="analytics-section">
                 <h3>Model Usage Analytics</h3>
                 {analyticsData.length === 0 ? (
@@ -881,14 +1079,14 @@ function App() {
                         </div>
                         <div className="excel-bars">
                           {analyticsData.map((item, idx) => {
-                            const barHeight = yAxisMax > 0 ? (item.request_count / yAxisMax) * 100 : 0
+                            const barHeight = yAxisMax > 0 ? ((item.request_number || 0) / yAxisMax) * 100 : 0
                             
                             return (
                               <div key={idx} className="excel-bar-col">
                                 <div 
                                   className="excel-bar"
                                   style={{ height: `${barHeight}%` }}
-                                  title={`${item.model_name}: ${item.request_count} requests`}
+                                  title={`${item.model_name}: ${item.request_number || 0} requests`}
                                 ></div>
                                 <div className="excel-x-label">{item.model_name}</div>
                               </div>
@@ -900,10 +1098,395 @@ function App() {
                   </div>
                 )}
               </div>
-            )}
+            ) : settingsTab === 'billing' ? (
+              <BillingSection />
+            ) : null}
           </div>
         </div>
       </div>
+    )
+  }
+
+  const BillingSection = () => {
+    const [selectedPlan, setSelectedPlan] = useState(null)
+    const [billingPeriod, setBillingPeriod] = useState('monthly')
+    const [showPlanSelection, setShowPlanSelection] = useState(false)
+    const [showBillingForm, setShowBillingForm] = useState(false)
+    const [selectedPlanForUpgrade, setSelectedPlanForUpgrade] = useState(null)
+    const [paymentIntent, setPaymentIntent] = useState(null)
+    const [upgradeForm, setUpgradeForm] = useState({
+      payment_method: 'stripe',
+      card_number: '',
+      expiry_date: '',
+      cvv: '',
+      billing_address: '',
+      city: '',
+      zip_code: '',
+      country: 'US'
+    })
+    
+    const handleUpgradeClick = () => {
+      setShowPlanSelection(true)
+    }
+    
+    const handlePlanSelect = async (plan) => {
+      setSelectedPlanForUpgrade(plan)
+      setShowPlanSelection(false)
+      
+      // Create payment intent
+      const token = localStorage.getItem('access_token')
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/billing/payment-intent`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            plan_id: plan.id,
+            billing_period: billingPeriod,
+            payment_method: 'stripe'
+          })
+        })
+        
+        if (res.ok) {
+          const data = await res.json()
+          setPaymentIntent(data)
+          setShowBillingForm(true)
+        } else {
+          const error = await res.json()
+          alert(`Failed to create payment intent: ${error.detail || 'Unknown error'}`)
+        }
+      } catch (err) {
+        console.error('Failed to create payment intent:', err)
+        alert('Failed to create payment intent. Please try again.')
+      }
+    }
+    
+    const handleUpgrade = async (e) => {
+      e.preventDefault()
+      const token = localStorage.getItem('access_token')
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/billing/upgrade`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            plan_id: selectedPlanForUpgrade.id,
+            billing_period: billingPeriod,
+            payment_method: upgradeForm.payment_method
+          })
+        })
+        
+        if (res.ok) {
+          const data = await res.json()
+          alert('Subscription upgraded successfully!')
+          setShowBillingForm(false)
+          setShowPlanSelection(false)
+          setSelectedPlanForUpgrade(null)
+          setPaymentIntent(null)
+          setUpgradeForm({
+            payment_method: 'stripe',
+            card_number: '',
+            expiry_date: '',
+            cvv: '',
+            billing_address: '',
+            city: '',
+            zip_code: '',
+            country: 'US'
+          })
+          fetchBillingInfo()
+        } else {
+          const error = await res.json()
+          alert(`Upgrade failed: ${error.detail || 'Unknown error'}`)
+        }
+      } catch (err) {
+        console.error('Failed to upgrade:', err)
+        alert('Failed to upgrade subscription. Please try again.')
+      }
+    }
+    
+    const handleCancel = async () => {
+      if (!confirm('Are you sure you want to cancel your subscription?')) return
+      
+      const token = localStorage.getItem('access_token')
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/billing/cancel`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`          },
+          body: JSON.stringify({ reason: 'User requested cancellation' })
+        })
+        
+        if (res.ok) {
+          const data = await res.json()
+          alert(data.message || 'Subscription cancelled successfully')
+          fetchBillingInfo()
+        } else {
+          const error = await res.json()
+          alert(`Cancellation failed: ${error.detail || 'Unknown error'}`)
+        }
+      } catch (err) {
+        console.error('Failed to cancel subscription:', err)
+        alert('Failed to cancel subscription. Please try again.')
+      }
+    }
+    
+    return (
+      <>
+        <div className="billing-section">
+          <h3>Billing & Subscription</h3>
+          
+          {/* Current Plan */}
+          <div className="current-plan-card">
+            <h4>Current Plan</h4>
+            <div className="plan-info">
+              <div className="plan-name">{billingInfo?.plan_name || 'Free'}</div>
+              <div className="plan-tier">{billingInfo?.plan_tier || 'free'}</div>
+              <div className="plan-status">
+                Status: <span className={`status-badge ${billingInfo?.status || 'active'}`}>
+                  {billingInfo?.status || 'active'}
+                </span>
+              </div>
+              {billingInfo?.is_subscribed && (
+                <div className="plan-dates">
+                  {billingInfo?.start_date && (
+                    <div>Started: {new Date(billingInfo.start_date).toLocaleDateString()}</div>
+                  )}
+                  {billingInfo?.end_date && (
+                    <div>Renews: {new Date(billingInfo.end_date).toLocaleDateString()}</div>
+                  )}
+                </div>
+              )}
+              {billingInfo?.is_subscribed && billingInfo?.status === 'active' && (
+                <button className="cancel-subscription-btn" onClick={handleCancel}>
+                  Cancel Subscription
+                </button>
+              )}
+              {(!billingInfo?.is_subscribed || billingInfo?.plan_tier === 'free') && (
+                <button className="upgrade-subscription-btn" onClick={handleUpgradeClick}>
+                  Upgrade Plan
+                </button>
+              )}
+            </div>
+          </div>
+          
+          {/* Available Plans */}
+          <div className="available-plans">
+            <h4>Available Plans</h4>
+            <div className="billing-period-toggle">
+              <button 
+                className={billingPeriod === 'monthly' ? 'active' : ''}
+                onClick={() => setBillingPeriod('monthly')}
+              >
+                Monthly
+              </button>
+              <button 
+                className={billingPeriod === 'yearly' ? 'active' : ''}
+                onClick={() => setBillingPeriod('yearly')}
+              >
+                Yearly
+              </button>
+            </div>
+            <div className="plans-grid">
+              {subscriptionPlans.map((plan) => (
+                <div key={plan.id} className={`plan-card ${billingInfo?.plan_tier === plan.plan_tier ? 'current' : ''}`}>
+                  <div className="plan-header">
+                    <h5>{plan.plan_name}</h5>
+                    <div className="plan-price">
+                      ${billingPeriod === 'monthly' ? plan.price_monthly : plan.price_yearly}
+                      <span className="price-period">/{billingPeriod === 'monthly' ? 'mo' : 'yr'}</span>
+                    </div>
+                  </div>
+                  <ul className="plan-features">
+                    {plan.features.map((feature, idx) => (
+                      <li key={idx}>{feature}</li>
+                    ))}
+                  </ul>
+                  {plan.max_requests_per_month && (
+                    <div className="plan-limits">
+                      {plan.max_requests_per_month} requests/month
+                    </div>
+                  )}
+                  {billingInfo?.plan_tier !== plan.plan_tier && (
+                    <button 
+                      className="select-plan-btn"
+                      onClick={() => handlePlanSelect(plan)}
+                    >
+                      {billingInfo?.is_subscribed ? 'Switch Plan' : 'Select Plan'}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        
+        {/* Plan Selection Modal */}
+        {showPlanSelection && (
+          <div className="modal-overlay" onClick={() => setShowPlanSelection(false)}>
+            <div className="plan-selection-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2>Select a Plan</h2>
+                <button className="close-btn" onClick={() => setShowPlanSelection(false)}>✕</button>
+              </div>
+              <div className="plan-selection-content">
+                <div className="billing-period-toggle">
+                  <button 
+                    className={billingPeriod === 'monthly' ? 'active' : ''}
+                    onClick={() => setBillingPeriod('monthly')}
+                  >
+                    Monthly
+                  </button>
+                  <button 
+                    className={billingPeriod === 'yearly' ? 'active' : ''}
+                    onClick={() => setBillingPeriod('yearly')}
+                  >
+                    Yearly
+                  </button>
+                </div>
+                <div className="plans-selection-grid">
+                  {subscriptionPlans.map((plan) => (
+                    <div key={plan.id} className="plan-selection-card">
+                      <h3>{plan.plan_name}</h3>
+                      <div className="plan-price-large">
+                        ${billingPeriod === 'monthly' ? plan.price_monthly : plan.price_yearly}
+                        <span>/{billingPeriod === 'monthly' ? 'mo' : 'yr'}</span>
+                      </div>
+                      <ul className="plan-features-list">
+                        {plan.features.map((feature, idx) => (
+                          <li key={idx}>{feature}</li>
+                        ))}
+                      </ul>
+                      <button 
+                        className="select-plan-modal-btn"
+                        onClick={() => handlePlanSelect(plan)}
+                      >
+                        Select {plan.plan_name}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        
+        {/* Billing Form Modal */}
+        {showBillingForm && selectedPlanForUpgrade && (
+          <div className="modal-overlay" onClick={() => setShowBillingForm(false)}>
+            <div className="upgrade-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="upgrade-modal-header">
+                <h2>Complete Payment for {selectedPlanForUpgrade.plan_name}</h2>
+                <button className="close-btn" onClick={() => setShowBillingForm(false)}>✕</button>
+              </div>
+              <form onSubmit={handleUpgrade} className="upgrade-form">
+                <div className="form-section">
+                  <h3>Payment Information</h3>
+                  <div className="form-row">
+                    <div className="form-field">
+                      <label>Card Number</label>
+                      <input 
+                        type="text" 
+                        placeholder="1234 5678 9012 3456"
+                        value={upgradeForm.card_number}
+                        onChange={(e) => setUpgradeForm({...upgradeForm, card_number: e.target.value})}
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div className="form-row">
+                    <div className="form-field">
+                      <label>Expiry Date</label>
+                      <input 
+                        type="text" 
+                        placeholder="MM/YY"
+                        value={upgradeForm.expiry_date}
+                        onChange={(e) => setUpgradeForm({...upgradeForm, expiry_date: e.target.value})}
+                        required
+                      />
+                    </div>
+                    <div className="form-field">
+                      <label>CVV</label>
+                      <input 
+                        type="text" 
+                        placeholder="123"
+                        value={upgradeForm.cvv}
+                        onChange={(e) => setUpgradeForm({...upgradeForm, cvv: e.target.value})}
+                        required
+                      />
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="form-section">
+                  <h3>Billing Address</h3>
+                  <div className="form-field">
+                    <label>Address</label>
+                    <input 
+                      type="text" 
+                      value={upgradeForm.billing_address}
+                      onChange={(e) => setUpgradeForm({...upgradeForm, billing_address: e.target.value})}
+                      required
+                    />
+                  </div>
+                  <div className="form-row">
+                    <div className="form-field">
+                      <label>City</label>
+                      <input 
+                        type="text" 
+                        value={upgradeForm.city}
+                        onChange={(e) => setUpgradeForm({...upgradeForm, city: e.target.value})}
+                        required
+                      />
+                    </div>
+                    <div className="form-field">
+                      <label>ZIP Code</label>
+                      <input 
+                        type="text" 
+                        value={upgradeForm.zip_code}
+                        onChange={(e) => setUpgradeForm({...upgradeForm, zip_code: e.target.value})}
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div className="form-field">
+                    <label>Country</label>
+                    <input 
+                      type="text" 
+                      value={upgradeForm.country}
+                      onChange={(e) => setUpgradeForm({...upgradeForm, country: e.target.value})}
+                      required
+                    />
+                  </div>
+                </div>
+                
+                <div className="upgrade-summary">
+                  <div className="summary-row">
+                    <span>Plan:</span>
+                    <span>{selectedPlanForUpgrade.plan_name}</span>
+                  </div>
+                  <div className="summary-row">
+                    <span>Billing Period:</span>
+                    <span>{billingPeriod === 'monthly' ? 'Monthly' : 'Yearly'}</span>
+                  </div>
+                  <div className="summary-row total">
+                    <span>Total:</span>
+                    <span>${billingPeriod === 'monthly' ? selectedPlanForUpgrade.price_monthly : selectedPlanForUpgrade.price_yearly}</span>
+                  </div>
+                </div>
+                
+                <button type="submit" className="upgrade-submit-btn">
+                  Complete Upgrade
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+      </>
     )
   }
 
@@ -957,7 +1540,7 @@ function App() {
                         className={`sidebar-item ${currentSessionId === session.session_id ? 'active' : ''}`}
                         onClick={() => loadSession(session.session_id)}
                       >
-                        {session.summary || 'New conversation'}
+                        {session.title || session.summary || 'New conversation'}
                       </button>
                       <button 
                         className="session-menu-btn"
@@ -972,7 +1555,7 @@ function App() {
                         <div className="context-menu" ref={contextMenuRef}>
                           <button onClick={() => {
                             setRenamingSession(session.session_id)
-                            setRenameValue(session.summary || 'New conversation')
+                            setRenameValue(session.title || session.summary || 'New conversation')
                             setShowContextMenu(null)
                           }}>
                             Rename
@@ -1032,9 +1615,25 @@ function App() {
                   </div>
                   <div className="chat-bubble">
                     <div className="chat-bubble-content">
-                      {m.content.split('\n').map((line, idx) => (
-                        <p key={idx}>{line || '\u00A0'}</p>
-                      ))}
+                      {(() => {
+                        // Check if message has code_blocks (from API response)
+                        const codeBlocks = m.code_blocks || []
+                        const parts = parseMessageContent(m.content, codeBlocks)
+                        
+                        return parts.map((part, partIdx) => {
+                          if (part.type === 'code') {
+                            return <CodeBlock key={partIdx} code={part.code} language={part.language} />
+                          } else {
+                            return (
+                              <div key={partIdx}>
+                                {part.content.split('\n').map((line, lineIdx) => (
+                                  <p key={lineIdx}>{line || '\u00A0'}</p>
+                                ))}
+                              </div>
+                            )
+                          }
+                        })
+                      })()}
                     </div>
                   </div>
                 </div>
@@ -1078,7 +1677,7 @@ function App() {
                       disabled={messageActions[m.id] === 'regenerating' || isLoading}
                       onClick={() => {
                         if (messageActions[m.id] !== 'regenerating' && !isLoading) {
-                          handleThumbsUp(m.id)
+                          handleThumbsUp(m.id, currentSessionId)
                         }
                       }}
                       title="Good response"
@@ -1095,7 +1694,7 @@ function App() {
                       disabled={messageActions[m.id] === 'regenerating' || isLoading}
                       onClick={() => {
                         if (messageActions[m.id] !== 'regenerating' && !isLoading) {
-                          handleThumbsDown(m.id)
+                          handleThumbsDown(m.id, currentSessionId)
                         }
                       }}
                       title="Bad response"
