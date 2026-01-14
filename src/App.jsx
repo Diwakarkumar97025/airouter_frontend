@@ -1,3 +1,4 @@
+
 import React, { useState, useRef, useEffect } from 'react'
 import './App.css'
 import googleIcon from './assets/icons/google.png'
@@ -428,7 +429,19 @@ function App() {
   const [renameValue, setRenameValue] = useState('')
   const [showSessionExpired, setShowSessionExpired] = useState(false)
   const [userProfile, setUserProfile] = useState(null)
+
+  // Email verification flow state
+  const [emailVerificationPending, setEmailVerificationPending] = useState(false)
+  const [pendingVerificationEmail, setPendingVerificationEmail] = useState(null)
+  const [verificationOtp, setVerificationOtp] = useState('')
+  const [verificationMessage, setVerificationMessage] = useState(null)
   const [queryMode, setQueryMode] = useState('normal')
+  const [selectedModel, setSelectedModel] = useState('auto') // 'auto' or model name
+  const [availableModels, setAvailableModels] = useState([]) // List of available models
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [uploadedImage, setUploadedImage] = useState(null) // Base64 image data
+  const [imagePreview, setImagePreview] = useState(null) // Image preview URL
+  const fileInputRef = useRef(null)
   const [messageActions, setMessageActions] = useState({}) // Track actions per message
   const [regenerateCounts, setRegenerateCounts] = useState({}) // Track regenerate count per message
   const [lastModelUsed, setLastModelUsed] = useState({}) // Track last model used per message
@@ -585,6 +598,71 @@ function App() {
     localStorage.setItem('query_mode', queryMode)
   }, [queryMode])
 
+  // Fetch available models when authenticated and mode changes
+  useEffect(() => {
+    if (isAuthenticated && queryMode && !emailVerificationPending) {
+      fetchAvailableModels()
+    }
+  }, [isAuthenticated, queryMode, emailVerificationPending])
+
+  const fetchAvailableModels = async () => {
+    setModelsLoading(true)
+    try {
+      const token = getAccessToken()
+      if (!token) return
+      
+      const res = await authenticatedFetch(`${API_BASE_URL}/api/models/available?mode=${queryMode}`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      })
+      
+      if (res.ok) {
+        const data = await res.json()
+        setAvailableModels(data.models || [])
+      } else {
+        console.error('Failed to fetch available models')
+      }
+    } catch (err) {
+      console.error('Error fetching available models:', err)
+    } finally {
+      setModelsLoading(false)
+    }
+  }
+
+  const handleImageUpload = async (file) => {
+    if (!file || !file.type.startsWith('image/')) {
+      alert('Please upload a valid image file')
+      return
+    }
+
+    // Check file size (max 10MB)
+    if (file.size > 10 * 1024 * 1024) {
+      alert('Image size must be less than 10MB')
+      return
+    }
+
+    // Create preview
+    const reader = new FileReader()
+    reader.onloadend = () => {
+      setImagePreview(reader.result)
+    }
+    reader.readAsDataURL(file)
+
+    // Convert to base64 for sending to backend
+    const base64Reader = new FileReader()
+    base64Reader.onloadend = () => {
+      const base64String = base64Reader.result.split(',')[1] // Remove data:image/...;base64, prefix
+      setUploadedImage({
+        data: base64String,
+        mimeType: file.type,
+        filename: file.name
+      })
+    }
+    base64Reader.readAsDataURL(file)
+  }
+
   useEffect(() => {
     const handleClickOutside = (event) => {
       if (settingsRef.current && !settingsRef.current.contains(event.target)) {
@@ -610,10 +688,10 @@ function App() {
     }
   }, [])
 
-  // Fetch billing info when settings opens to check for BYOK plan
+  // Fetch billing info when settings opens to check for BYOK plan (lazy - only plan info)
   useEffect(() => {
     if (showSettings) {
-      fetchBillingInfo() // Always fetch to ensure we have latest plan info
+      fetchBillingInfo(false) // Only fetch plan info, not additional data (lazy loading)
     }
   }, [showSettings])
 
@@ -621,29 +699,37 @@ function App() {
 
   const fetchUserProfile = async (token) => {
     try {
-      const res = await authenticatedFetch(`${API_BASE_URL}/me`)
-      
+      const res = await authenticatedFetch(`${API_BASE_URL}/api/me`)
+
       if (res.status === 401) {
         // Token refresh failed or no valid tokens
         clearTokens()
         setShowSessionExpired(true)
         setIsAuthenticated(false)
         setShowAuthModal(true)
-        return
+        return null
       }
-      
+
       if (res.ok) {
         const userData = await res.json()
         setUser(userData)
         setIsAuthenticated(true)
         setShowAuthModal(false)
+        // If email is not verified, show the verification holding modal/page
+        if (!userData.email_verified) {
+          setEmailVerificationPending(true)
+          setPendingVerificationEmail(userData.email)
+        } else {
+          setEmailVerificationPending(false)
+        }
         const currentToken = getAccessToken()
-        if (currentToken) {
+        if (currentToken && userData.email_verified) {
           await loadSessions(userData.id, currentToken)
           loadUserProfile(currentToken)
-          // Fetch billing info and usage on login
-          await fetchBillingInfo()
+          // Fetch billing info on login (only plan info, lazy load rest)
+          await fetchBillingInfo(false)
         }
+        return userData
       } else {
         throw new Error('Invalid token')
       }
@@ -652,31 +738,109 @@ function App() {
       clearTokens()
       setShowAuthModal(true)
       setIsAuthenticated(false)
+      return null
+    }
+  }
+
+  // Email verification helpers (state declared earlier at top of component)
+  const resendVerification = async (email) => {
+    if (!email) {
+      setVerificationMessage('Missing email address to resend OTP.')
+      return
+    }
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/email/verify/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      })
+      if (res.ok) {
+        setVerificationMessage('Verification code resent if account exists.')
+      } else {
+        setVerificationMessage('Failed to resend verification code. Try again.')
+      }
+    } catch (e) {
+      setVerificationMessage('Network error while resending verification code.')
+    }
+  }
+
+  const confirmVerification = async (email) => {
+    if (!email) {
+      setVerificationMessage('Missing email address to confirm verification.')
+      return
+    }
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/email/verify/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, otp: verificationOtp })
+      })
+
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}))
+        setVerificationMessage(payload.detail || 'Verification failed. Check code and try again.')
+        return
+      }
+
+      // Success
+      setVerificationMessage('Email verified successfully. Redirecting...')
+      setEmailVerificationPending(false)
+      setPendingVerificationEmail(null)
+      setVerificationOtp('')
+
+      // Refresh profile and load sessions, then navigate to main chat (pick first session if exists or create new)
+      const tokens = getTokens()
+      if (tokens) {
+        try {
+          const userData = await fetchUserProfile(tokens.access_token)
+          if (userData && userData.id) {
+            const fetchedSessions = await loadSessions(userData.id, tokens.access_token)
+            if (fetchedSessions && fetchedSessions.length > 0) {
+              setCurrentSessionId(fetchedSessions[0].id)
+            } else {
+              // No existing sessions - create a new chat session and open it
+              await createNewChat()
+            }
+          }
+        } catch (err) {
+          console.error('Failed to finalize verification redirect:', err)
+        }
+      }
+
+    } catch (e) {
+      setVerificationMessage('Network error while verifying code.')
     }
   }
 
   const loadUserProfile = async (token) => {
     try {
       const res = await authenticatedFetch(`${API_BASE_URL}/api/user/profile`)
-      
       if (res.status === 401) {
         // Token refresh failed
         clearTokens()
         setShowSessionExpired(true)
         setIsAuthenticated(false)
-        return
+        return null
       }
-      
+
       if (res.ok) {
         const data = await res.json()
         setUserProfile(data)
+        return data
+      } else {
+        // Non-OK response
+        console.error('Failed to load profile: non-ok response', res.status)
+        return null
       }
     } catch (err) {
       console.error('Failed to load profile:', err)
+      return null
     }
   }
 
   const loadSessions = async (userId, token) => {
+    if (emailVerificationPending) return []
     try {
       const res = await authenticatedFetch(`${API_BASE_URL}/api/users/${userId}/sessions`)
       
@@ -705,12 +869,12 @@ function App() {
   }
 
   const createNewChat = async () => {
+    if (emailVerificationPending) return
     const token = localStorage.getItem('access_token')
     try {
       const res = await fetch(`${API_BASE_URL}/api/chat/new`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
-      })
+        headers: { 'Authorization': `Bearer ${token}` } })
       
       if (res.status === 401) {
         setShowSessionExpired(false)
@@ -1159,7 +1323,8 @@ function App() {
   const sendMessage = async (e) => {
     e.preventDefault()
     const trimmed = input.trim()
-    if (!trimmed || isLoading) return
+    // Allow sending if there's either text or an image
+    if ((!trimmed && !uploadedImage) || isLoading) return
 
     if (!currentSessionId) {
       await createNewChat()
@@ -1179,11 +1344,14 @@ function App() {
     const userMessage = {
       id: Date.now(),
       role: 'user',
-      content: trimmed
+      content: trimmed || (uploadedImage ? '[Image uploaded]' : ''),
+      image: uploadedImage ? imagePreview : null
     }
 
     setMessages((prev) => [...prev, userMessage])
     setInput('')
+    setUploadedImage(null)
+    setImagePreview(null)
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
     setIsLoading(true)
     
@@ -1228,18 +1396,33 @@ function App() {
         session_id: currentSessionId
       }
 
+      // Add image data if uploaded
+      if (uploadedImage) {
+        requestBody.image_data = uploadedImage.data
+        requestBody.image_mime_type = uploadedImage.mimeType
+        requestBody.image_filename = uploadedImage.filename
+      }
+
+      // Set mode based on queryMode
       if (queryMode === 'web_search') {
         requestBody.mode = 'web_search'
-        requestBody.handler = 'web_search'
       } else if (queryMode === 'code') {
-        requestBody.model = 'codellama:7b'
         requestBody.mode = 'code'
-        requestBody.handler = 'call_ollama'
       } else {
-        requestBody.model = 'mistral:7b'
         requestBody.mode = 'normal'
-        requestBody.handler = 'call_ollama'
       }
+      
+      // Add selected_model (Section 4 - Manual Override)
+      // NEW SCHEMA: Only use selected_model, NOT model/handler
+      // If user selected a model, use it; otherwise use "auto" (null means auto)
+      if (selectedModel && selectedModel !== 'auto') {
+        requestBody.selected_model = selectedModel
+      } else {
+        requestBody.selected_model = null  // null means "auto" routing
+      }
+      
+      // REMOVED: Old schema fields (model, handler) - no longer needed
+      // The backend will determine the handler based on selected_model or auto-routing
       
       // Enable SSE streaming for real-time status updates
       requestBody.stream_status = true
@@ -1494,6 +1677,7 @@ function App() {
   }
 
   const fetchAnalytics = async () => {
+    if (emailVerificationPending) return
     const token = localStorage.getItem('access_token')
     try {
       const res = await fetch(`${API_BASE_URL}/api/user/model_usage`, {
@@ -1514,7 +1698,8 @@ function App() {
     }
   }
 
-  const fetchBillingInfo = async () => {
+  const fetchBillingInfo = async (fetchAdditional = false) => {
+    if (emailVerificationPending) return
     try {
       const planRes = await authenticatedFetch(`${API_BASE_URL}/api/billing/plan`)
       if (planRes.status === 401) {
@@ -1544,43 +1729,253 @@ function App() {
         setSubscriptionPlans(plansData || [])
       }
       
-      // Also fetch usage summary
-      await fetchUsageSummary()
-      // Refresh billing history/invoices for current range
-      await fetchBillingHistory()
-      await fetchInvoices()
+      // Only fetch additional data if explicitly requested (lazy loading)
+      if (fetchAdditional) {
+        await fetchUsageSummary()
+        await fetchBillingHistory()
+        await fetchInvoices()
+      }
     } catch (err) {
       console.error('Failed to fetch billing info:', err)
     }
   }
 
   const [monitoringUsagePlot, setMonitoringUsagePlot] = useState(null)
-  const [monitoringPerformancePlot, setMonitoringPerformancePlot] = useState(null)
   const [monitoringCostPlot, setMonitoringCostPlot] = useState(null)
-  const [monitoringCostComparisonPlot, setMonitoringCostComparisonPlot] = useState(null)
   const [monitoringTokenUsagePlot, setMonitoringTokenUsagePlot] = useState(null)
-  const [monitoringVendorSavingsPlot, setMonitoringVendorSavingsPlot] = useState(null)
+  const [monitoringVendorCostComparison, setMonitoringVendorCostComparison] = useState([])
+  const [monitoringVendorCostPlot, setMonitoringVendorCostPlot] = useState(null)
+  const [averageCostSaved, setAverageCostSaved] = useState(0)
+  const [currentMonthActualCost, setCurrentMonthActualCost] = useState(0)
+  const [currentMonthSavings, setCurrentMonthSavings] = useState(0)
+  const [showMoneyAnimation, setShowMoneyAnimation] = useState(false)
 
   const fetchMonitoringData = async () => {
+    if (emailVerificationPending) return
     try {
       setMonitoringLoading(true)
       setMonitoringError(null)
   
-      const [usage, perf, cost, costComparison, tokenUsage, vendorSavings] = await Promise.all([
-        authenticatedFetch(`${API_BASE_URL}/api/analytics/models/plots/usage`),
-        authenticatedFetch(`${API_BASE_URL}/api/analytics/models/plots/performance`),
-        authenticatedFetch(`${API_BASE_URL}/api/analytics/models/plots/cost-vs-success`),
-        authenticatedFetch(`${API_BASE_URL}/api/analytics/models/plots/cost-comparison`),
-        authenticatedFetch(`${API_BASE_URL}/api/analytics/models/plots/token-usage`),
-        authenticatedFetch(`${API_BASE_URL}/api/analytics/models/plots/vendor-savings-gantt`)
+      // Fetch from database-based endpoints (user-specific data from billing table)
+      // Get model usage from API endpoint instead of log files
+      const [modelUsageData, tokenUsageData, tokenTimeSeriesData, costStatsData, vendorComparison] = await Promise.all([
+        authenticatedFetch(`${API_BASE_URL}/api/user/model_usage`),
+        authenticatedFetch(`${API_BASE_URL}/api/analytics/db/token-usage`),
+        authenticatedFetch(`${API_BASE_URL}/api/analytics/db/token-usage-timeseries`),
+        authenticatedFetch(`${API_BASE_URL}/api/analytics/db/cost-stats`),
+        authenticatedFetch(`${API_BASE_URL}/api/analytics/db/vendor-cost-comparison`)
       ])
   
-      if (usage.ok) setMonitoringUsagePlot(await usage.json())
-      if (perf.ok) setMonitoringPerformancePlot(await perf.json())
-      if (cost.ok) setMonitoringCostPlot(await cost.json())
-      if (costComparison.ok) setMonitoringCostComparisonPlot(await costComparison.json())
-      if (tokenUsage.ok) setMonitoringTokenUsagePlot(await tokenUsage.json())
-      if (vendorSavings.ok) setMonitoringVendorSavingsPlot(await vendorSavings.json())
+      // Process model usage data from API endpoint (grouped by model name with usage count)
+      if (modelUsageData.ok) {
+        const usageData = await modelUsageData.json()
+        // Filter out negative usage values
+        const filteredUsage = usageData.filter(item => item.request_number > 0)
+        
+        // Create bar chart for model usage
+        const plotData = {
+          data: [{
+            type: 'bar',
+            x: filteredUsage.map(item => item.model_name),
+            y: filteredUsage.map(item => item.request_number),
+            marker: {
+              color: 'rgb(55, 83, 109)'
+            },
+            hovertemplate: '<b>%{x}</b><br>Usage: %{y} requests<extra></extra>'
+          }],
+          layout: {
+            title: 'Model Usage',
+            xaxis: { 
+              title: 'Model',
+              tickangle: -45
+            },
+            yaxis: { 
+              title: 'Number of Requests',
+              tickformat: ',.0f'
+            },
+            hovermode: 'closest'
+          }
+        }
+        setMonitoringUsagePlot(plotData)
+      }
+      
+      // Process token usage time series data from database - show stacked bars over time
+      if (tokenTimeSeriesData.ok) {
+        const timeSeriesData = await tokenTimeSeriesData.json()
+        
+        // Group by timestamp and model
+        const timeGroups = {}
+        const modelSet = new Set()
+        
+        timeSeriesData.forEach(item => {
+          const timestamp = item.timestamp
+          const model = item.model
+          modelSet.add(model)
+          
+          if (!timeGroups[timestamp]) {
+            timeGroups[timestamp] = {}
+          }
+          if (!timeGroups[timestamp][model]) {
+            timeGroups[timestamp][model] = 0
+          }
+          timeGroups[timestamp][model] += item.total_tokens
+        })
+        
+        // Sort timestamps
+        const sortedTimestamps = Object.keys(timeGroups).sort()
+        const models = Array.from(modelSet).sort()
+        
+        // Create stacked bar chart data
+        const plotData = {
+          data: models.map((model, idx) => ({
+            type: 'bar',
+            name: model,
+            x: sortedTimestamps,
+            y: sortedTimestamps.map(ts => timeGroups[ts][model] || 0),
+            hovertemplate: `<b>${model}</b><br>Time: %{x}<br>Tokens: %{y:,.0f}<extra></extra>`,
+            marker: { 
+              color: `hsl(${(idx * 360 / models.length) % 360}, 70%, 50%)`
+            }
+          })),
+          layout: {
+            title: 'Tokens By Model',
+            xaxis: { 
+              title: 'Time',
+              type: 'date'
+            },
+            yaxis: { 
+              title: 'Tokens',
+              tickformat: ',.0f'
+            },
+            barmode: 'stack',
+            hovermode: 'x unified', // Filter on hover instead of click
+            showlegend: true,
+            legend: {
+              orientation: 'h',
+              y: -0.2
+            }
+          }
+        }
+        setMonitoringTokenUsagePlot(plotData)
+      }
+      
+      // Process cost stats data from database - show average cost per request
+      if (costStatsData.ok) {
+        const costData = await costStatsData.json()
+        // Create cost vs success plot showing models, total cost, and average cost per request
+        const plotData = {
+          data: [{
+            type: 'scatter',
+            mode: 'markers+text',
+            x: costData.map(item => item.total_requests),
+            y: costData.map(item => item.avg_cost_per_request),
+            text: costData.map(item => item.model),
+            textposition: 'top center',
+            marker: {
+              size: costData.map(item => Math.max(8, Math.min(30, Math.sqrt(item.total_cost) * 3))),
+              color: costData.map(item => item.total_cost),
+              colorscale: 'Viridis',
+              showscale: true,
+              colorbar: { title: 'Total Cost ($)' }
+            },
+            hovertemplate: '<b>%{text}</b><br>Total Cost: $%{marker.color:.4f}<br>Avg Cost/Request: $%{y:.4f}<br>Total Requests: %{x}<br>Total Tokens: %{customdata}<extra></extra>',
+            customdata: costData.map(item => item.total_tokens.toLocaleString())
+          }],
+          layout: {
+            title: 'Average Cost per Request',
+            xaxis: { title: 'Total Requests' },
+            yaxis: { title: 'Average Cost per Request ($)' },
+            hovermode: 'closest'
+          }
+        }
+        setMonitoringCostPlot(plotData)
+      }
+      
+      // Process vendor cost comparison
+      if (vendorComparison.ok) {
+        const vendorData = await vendorComparison.json()
+        
+        // Check if actual cost is the same for all vendors
+        const actualCosts = vendorData.map(v => v.actual_cost)
+        const allSameCost = actualCosts.length > 0 && actualCosts.every(cost => cost === actualCosts[0])
+        
+        // Only show if actual costs are different, or if there are savings
+        if (!allSameCost || vendorData.some(v => v.savings > 0)) {
+          setMonitoringVendorCostComparison(vendorData)
+          
+          // Calculate totals for current month
+          const actualCost = vendorData.length > 0 ? vendorData[0].actual_cost : 0
+          const totalSavings = vendorData.reduce((sum, v) => sum + Math.max(0, v.savings), 0) // Only positive savings
+          setCurrentMonthActualCost(actualCost)
+          setCurrentMonthSavings(totalSavings)
+          
+          // Calculate average cost saved - average of all vendor savings (positive and negative)
+          // Get average of total vendor average savings
+          const totalSavingsAll = vendorData.reduce((sum, v) => sum + v.savings, 0)
+          const avgSaved = vendorData.length > 0 ? totalSavingsAll / vendorData.length : 0
+          setAverageCostSaved(avgSaved)
+          
+          // Create vendor cost comparison graph
+          const vendors = vendorData.map(v => v.vendor)
+          const wouldCosts = vendorData.map(v => v.would_cost)
+          const actualCostValue = vendorData.length > 0 ? vendorData[0].actual_cost : 0
+          
+          const plotData = {
+            data: [
+              // Actual cost bar (green)
+              {
+                type: 'bar',
+                name: 'Actual Cost',
+                x: vendors,
+                y: vendors.map(() => actualCostValue),
+                marker: { color: '#28a745' }, // Green for actual cost
+                hovertemplate: '<b>Actual Cost</b><br>Vendor: %{x}<br>Cost: $%{y:.4f}<extra></extra>'
+              },
+              // Would cost bars (blue/gray for comparison)
+              {
+                type: 'bar',
+                name: 'Would Cost',
+                x: vendors,
+                y: wouldCosts,
+                marker: { color: '#6c757d' }, // Gray for would cost (future comparison)
+                hovertemplate: '<b>Would Cost</b><br>Vendor: %{x}<br>Cost: $%{y:.4f}<extra></extra>'
+              }
+            ],
+            layout: {
+              title: 'Vendor Cost Comparison',
+              xaxis: { 
+                title: 'Vendor',
+                tickangle: -45
+              },
+              yaxis: { 
+                title: 'Cost ($)',
+                tickformat: '$.4f'
+              },
+              barmode: 'group',
+              hovermode: 'closest',
+              showlegend: true,
+              legend: {
+                orientation: 'h',
+                y: -0.2
+              }
+            }
+          }
+          setMonitoringVendorCostPlot(plotData)
+          
+          // Show money animation if there are savings (only once, when avgSaved > 0)
+          if (avgSaved > 0 && !showMoneyAnimation) {
+            setShowMoneyAnimation(true)
+            setTimeout(() => setShowMoneyAnimation(false), 3000) // Hide after 3 seconds
+          }
+        } else {
+          // Don't show if all costs are same and no savings
+          setMonitoringVendorCostComparison([])
+          setMonitoringVendorCostPlot(null)
+          setAverageCostSaved(0)
+          setCurrentMonthActualCost(0)
+          setCurrentMonthSavings(0)
+        }
+      }
     } catch (err) {
       setMonitoringError("Failed to load monitoring charts")
     } finally {
@@ -1589,6 +1984,7 @@ function App() {
   }
 
   const fetchUsageSummary = async () => {
+    if (emailVerificationPending) return null
     const token = localStorage.getItem('access_token')
     try {
       const res = await fetch(`${API_BASE_URL}/api/billing/usage`, {
@@ -1612,6 +2008,7 @@ function App() {
   }
 
   const fetchUsageWarnings = async () => {
+    if (emailVerificationPending) return
     const token = localStorage.getItem('access_token')
     try {
       const res = await fetch(`${API_BASE_URL}/api/billing/usage/warnings`, {
@@ -1659,6 +2056,7 @@ function App() {
   ]
 
   const fetchAPIKeysStatus = async () => {
+    if (emailVerificationPending) return
     setApiKeysLoading(true)
     setApiKeysError(null)
     try {
@@ -1761,6 +2159,7 @@ function App() {
   }
 
   const fetchBillingHistory = async (range = dateRange) => {
+    if (emailVerificationPending) return
     const token = localStorage.getItem('access_token')
     try {
       const params = new URLSearchParams()
@@ -2153,18 +2552,26 @@ function App() {
         last_model_used: lastModel
       }
 
+      // Set mode based on queryMode
       if (queryMode === 'web_search') {
         requestBody.mode = 'web_search'
-        requestBody.handler = 'web_search'
       } else if (queryMode === 'code') {
-        requestBody.model = 'codellama:7b'
         requestBody.mode = 'code'
-        requestBody.handler = 'call_ollama'
       } else {
-        requestBody.model = 'mistral:7b'
         requestBody.mode = 'normal'
-        requestBody.handler = 'call_ollama'
       }
+      
+      // Add selected_model (Section 4 - Manual Override)
+      // NEW SCHEMA: Only use selected_model, NOT model/handler
+      // If user selected a model, use it; otherwise use "auto" (null means auto)
+      if (selectedModel && selectedModel !== 'auto') {
+        requestBody.selected_model = selectedModel
+      } else {
+        requestBody.selected_model = null  // null means "auto" routing
+      }
+      
+      // REMOVED: Old schema fields (model, handler) - no longer needed
+      // The backend will determine the handler based on selected_model or auto-routing
       
       console.log('Regenerating with payload:', requestBody)
       
@@ -2402,7 +2809,22 @@ function App() {
         .then(data => {
           // Save tokens with expiry information
           saveTokens(data)
-          fetchUserProfile(data.access_token)
+          // If email is not verified, show verification page and do not load profile
+          if (data && data.email_verified === false) {
+            setEmailVerificationPending(true)
+            setPendingVerificationEmail(formData.email)
+            setShowAuthModal(false)
+            setIsAuthenticated(true)
+          } else {
+            // Clear any pending verification state and mark authenticated before loading profile
+            setEmailVerificationPending(false)
+            setPendingVerificationEmail(null)
+            setShowAuthModal(false)
+            setIsAuthenticated(true)
+            // Populate minimal user immediately so UI shows chat when verified
+            setUser({ email: formData.email, email_verified: true })
+            fetchUserProfile(data.access_token)
+          }
         })
         .catch(err => {
           setError(err.message || 'Network error')
@@ -2411,54 +2833,59 @@ function App() {
     }
     
     return (
-      <div className="modal-overlay">
-        <div className="modal-content">
-          <h2>{authMode === 'login' ? 'Login to LLM Router' : 'Create Account'}</h2>
-          {error && (
-            <div className={`error-message ${error.includes('created') ? 'success' : ''}`}>
-              {error}
-              {authMode === 'login' && !error.includes('created') && (
-                <div style={{ marginTop: '10px', textAlign: 'center' }}>
-                  <a 
-                    href="#" 
-                    onClick={(e) => {
-                      e.preventDefault()
-                      setShowPasswordReset(true)
-                      setError(null)
-                    }}
-                    style={{ color: '#007bff', textDecoration: 'underline', fontSize: '14px' }}
-                  >
-                    Forgot Password? Reset it here
-                  </a>
-                </div>
-              )}
-            </div>
-          )}
-          <form onSubmit={handleFormSubmit}>
-            <input ref={emailRef} type="email" placeholder="Email" defaultValue="" required />
-            {authMode === 'signup' && (
-              <>
-                <input ref={usernameRef} type="text" placeholder="Username" defaultValue="" required />
-                <input ref={firstNameRef} type="text" placeholder="First Name" defaultValue="" required />
-                <input ref={lastNameRef} type="text" placeholder="Last Name" defaultValue="" required />
-              </>
+      <>
+        <div className="modal-overlay">
+          <div className="modal-content">
+            <h2>{authMode === 'login' ? 'Login to Vector' : 'Create Account'}</h2>
+            {error && (
+              <div className={`error-message ${error.includes('created') ? 'success' : ''}`}>
+                {error}
+                {authMode === 'login' && !error.includes('created') && (
+                  <div style={{ marginTop: '10px', textAlign: 'center' }}>
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault()
+                        setShowPasswordReset(true)
+                        setError(null)
+                      }}
+                      style={{ color: '#007bff', textDecoration: 'underline', fontSize: '14px' }}
+                    >
+                      Forgot Password? Reset it here
+                    </a>
+                  </div>
+                )}
+              </div>
             )}
-            <input ref={passwordRef} type="password" placeholder="Password" defaultValue="" required />
-            <button type="submit" className="auth-btn">
-              {authMode === 'login' ? 'Login' : 'Sign Up'}
+            <form onSubmit={handleFormSubmit}>
+              <input ref={emailRef} type="email" placeholder="Email" defaultValue="" required />
+              {authMode === 'signup' && (
+                <>
+                  <input ref={usernameRef} type="text" placeholder="Username" defaultValue="" required />
+                  <input ref={firstNameRef} type="text" placeholder="First Name" defaultValue="" required />
+                  <input ref={lastNameRef} type="text" placeholder="Last Name" defaultValue="" required />
+                </>
+              )}
+              <input ref={passwordRef} type="password" placeholder="Password" defaultValue="" required />
+              <button type="submit" className="auth-btn">
+                {authMode === 'login' ? 'Login' : 'Sign Up'}
+              </button>
+            </form>
+
+            <button
+              className="auth-switch-btn"
+              onClick={() => {
+                setAuthMode(authMode === 'login' ? 'signup' : 'login')
+                setError(null)
+              }}
+            >
+              {authMode === 'login' ? 'Need an account? Sign up' : 'Have an account? Login'}
             </button>
-          </form>
-          <button 
-            className="auth-switch-btn"
-            onClick={() => {
-              setAuthMode(authMode === 'login' ? 'signup' : 'login')
-              setError(null)
-            }}
-          >
-            {authMode === 'login' ? 'Need an account? Sign up' : 'Have an account? Login'}
-          </button>
+          </div>
         </div>
-      </div>
+
+
+      </>
     )
   }
 
@@ -2470,6 +2897,33 @@ function App() {
           Your session has expired. Please login again to continue.
         </p>
         <button className="auth-btn" onClick={handleSessionExpiredClose}>OK</button>
+      </div>
+    </div>
+  )
+
+  // Full-page email verification screen (matches app theming)
+  const EmailVerificationPage = () => (
+    <div className="verify-page" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh' }}>
+      <div className="verify-container" style={{ width: '460px', padding: '28px', borderRadius: '8px', background: '#fff', boxShadow: '0 8px 30px rgba(0,0,0,0.06)' }}>
+        <h2>Email verification required</h2>
+        <p style={{ color: '#666' }}>Enter the 6-digit code sent to <strong>{pendingVerificationEmail || user?.email || 'your email'}</strong> to continue.</p>
+
+        <div style={{ marginTop: '16px', display: 'flex', gap: '8px' }}>
+          <input value={verificationOtp} onChange={(e) => setVerificationOtp(e.target.value)} type="text" placeholder="Enter OTP" style={{ flex: 1, padding: '8px' }} />
+          <button className="auth-btn" onClick={() => confirmVerification(pendingVerificationEmail || user?.email)}>Verify</button>
+        </div>
+
+        <div style={{ marginTop: '12px' }}>
+          <a href="#" onClick={(e) => { e.preventDefault(); setVerificationMessage(null); setVerificationOtp(''); resendVerification(pendingVerificationEmail || user?.email); }}>Send OTP again</a>
+        </div>
+
+        {verificationMessage && (
+          <div style={{ marginTop: '12px' }} className="success-message">{verificationMessage}</div>
+        )}
+
+        <div style={{ marginTop: '18px', textAlign: 'right' }}>
+          <a href="#" onClick={(e) => { e.preventDefault(); clearTokens(); setIsAuthenticated(false); setEmailVerificationPending(false); setPendingVerificationEmail(null); setShowAuthModal(true); }}>Logout / Switch account</a>
+        </div>
       </div>
     </div>
   )
@@ -2698,7 +3152,12 @@ function App() {
             </button>
             <button 
               className={`settings-tab ${settingsTab === 'usage' ? 'active' : ''}`}
-              onClick={() => { setSettingsTab('usage'); fetchUsageSummary(); fetchBillingHistory(); }}
+              onClick={() => { 
+                setSettingsTab('usage')
+                // Lazy load: only fetch when tab is clicked
+                fetchUsageSummary()
+                fetchBillingHistory()
+              }}
             >
               Usage
             </button>
@@ -2706,8 +3165,9 @@ function App() {
               className={`settings-tab ${settingsTab === 'billing' ? 'active' : ''}`}
               onClick={() => { 
                 setSettingsTab('billing')
-                fetchBillingInfo()
-                fetchBillingHistory()
+                // Lazy load: only fetch when tab is clicked
+                fetchBillingInfo(false)  // Don't fetch additional data
+                fetchInvoices()  // Fetch invoices for billing tab
               }}
             >
               Billing & Invoices
@@ -2811,7 +3271,30 @@ function App() {
               </div>
             ) : settingsTab === 'monitoring' ? (
               <div className="monitoring-section">
-                <h3>Routing Monitoring</h3>
+                <div className="monitoring-header">
+                  <h3>Routing Monitoring</h3>
+                  {/* Summary table on top right */}
+                  <div className="monitoring-summary-table">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Metric</th>
+                          <th>Value</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr>
+                          <td>Actual Cost (Current Month)</td>
+                          <td>${currentMonthActualCost.toFixed(4)}</td>
+                        </tr>
+                        <tr>
+                          <td>Savings</td>
+                          <td className="savings-positive">${currentMonthSavings.toFixed(4)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
                 {monitoringLoading && (
                   <div className="loading">Loading analytics…</div>
                 )}
@@ -2820,6 +3303,19 @@ function App() {
                 )}
                 {!monitoringLoading && !monitoringError && (
                   <>
+                    {/* Overall saving and actual cost at top */}
+                    {averageCostSaved > 0 && (
+                      <div className="monitoring-top-summary">
+                        <div className="summary-item">
+                          <span className="summary-label">Average Cost Saved:</span>
+                          <span className="summary-value savings-positive">${averageCostSaved.toFixed(4)}</span>
+                        </div>
+                        <div className="summary-item">
+                          <span className="summary-label">Actual Cost:</span>
+                          <span className="summary-value">${currentMonthActualCost.toFixed(4)}</span>
+                        </div>
+                      </div>
+                    )}
                     <div className="monitoring-charts-grid">
                       {monitoringUsagePlot && (
                         <div className="monitoring-chart-card">
@@ -2832,59 +3328,55 @@ function App() {
                         </div>
                       )}
                       
-                      {monitoringPerformancePlot && (
-                        <div className="monitoring-chart-card">
-                          <h4>Average Latency</h4>
-                          <Plot
-                            data={monitoringPerformancePlot.data || []}
-                            layout={monitoringPerformancePlot.layout || {}}
-                            style={{ width: '100%', height: '400px' }}
-                          />
-                        </div>
-                      )}
-                      
                       {monitoringCostPlot && (
                         <div className="monitoring-chart-card">
-                          <h4>Cost vs Success Rate</h4>
+                          <h4>Average Cost per Request</h4>
                           <Plot
                             data={monitoringCostPlot.data || []}
                             layout={monitoringCostPlot.layout || {}}
                             style={{ width: '100%', height: '400px' }}
+                            config={{ displayModeBar: false }}
                           />
                         </div>
                       )}
                       
                       {monitoringTokenUsagePlot && (
                         <div className="monitoring-chart-card">
-                          <h4>Token Usage by Model</h4>
+                          <h4>Tokens By Model</h4>
                           <Plot
                             data={monitoringTokenUsagePlot.data || []}
                             layout={monitoringTokenUsagePlot.layout || {}}
                             style={{ width: '100%', height: '400px' }}
+                            config={{ displayModeBar: false }}
                           />
                         </div>
                       )}
                       
-                      {monitoringCostComparisonPlot && (
+                      {/* Vendor Cost Comparison Graph */}
+                      {monitoringVendorCostPlot && (
                         <div className="monitoring-chart-card">
-                          <h4>Cost Comparison: Actual vs Alternatives</h4>
+                          <h4>Vendor Cost Comparison</h4>
+                          {showMoneyAnimation && averageCostSaved > 0 && (
+                            <div className="money-drip-animation">
+                              💰 ${averageCostSaved.toFixed(4)} Average Savings
+                            </div>
+                          )}
                           <Plot
-                            data={monitoringCostComparisonPlot.data || []}
-                            layout={monitoringCostComparisonPlot.layout || {}}
+                            data={monitoringVendorCostPlot.data || []}
+                            layout={monitoringVendorCostPlot.layout || {}}
                             style={{ width: '100%', height: '400px' }}
+                            config={{ displayModeBar: false }}
                           />
-                        </div>
-                      )}
-                      
-                      {monitoringVendorSavingsPlot && (
-                        <div className="monitoring-chart-card">
-                          <h4>Vendor Cost Savings (Gantt Chart)</h4>
-                          <p className="chart-description">Shows actual cost vs what it would have cost with alternative vendors. Green = actual cost, Orange/Red = alternative cost.</p>
-                          <Plot
-                            data={monitoringVendorSavingsPlot.data || []}
-                            layout={monitoringVendorSavingsPlot.layout || {}}
-                            style={{ width: '100%', height: '600px' }}
-                          />
+                          <div className="vendor-cost-legend">
+                            <div className="legend-item">
+                              <span className="legend-color" style={{ backgroundColor: '#28a745' }}></span>
+                              <span className="legend-label">Actual Cost</span>
+                            </div>
+                            <div className="legend-item">
+                              <span className="legend-color" style={{ backgroundColor: '#6c757d' }}></span>
+                              <span className="legend-label">Would Cost (Comparison)</span>
+                            </div>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -3125,7 +3617,18 @@ function App() {
                       // For now, it just sets the payment method
                     }}
                   >
-                    <span className="apple-pay-icon">🍎</span>
+                    <img 
+                      src="https://developer.apple.com/pay/images/apple-pay-mark.png" 
+                      alt="Apple Pay" 
+                      className="apple-pay-icon"
+                      style={{ height: '20px', width: 'auto' }}
+                      onError={(e) => {
+                        // Fallback to text if image fails to load
+                        e.target.style.display = 'none'
+                        e.target.nextSibling.textContent = 'Apple Pay'
+                      }}
+                    />
+                    <span style={{ display: 'none' }}>Apple Pay</span>
                     Pay
                   </button>
                   
@@ -3189,7 +3692,11 @@ function App() {
                           type="text" 
                           placeholder="1234 5678 9012 3456"
                           value={upgradeForm.card_number}
-                          onChange={(e) => setUpgradeForm({...upgradeForm, card_number: e.target.value})}
+                          onChange={(e) => {
+                            const newValue = e.target.value
+                            setUpgradeForm(prev => ({...prev, card_number: newValue}))
+                          }}
+                          autoComplete="cc-number"
                           required={selectedPaymentMethod === 'card'}
                         />
                       </div>
@@ -3200,7 +3707,11 @@ function App() {
                             type="text" 
                             placeholder="MM/YY"
                             value={upgradeForm.expiry_date}
-                            onChange={(e) => setUpgradeForm({...upgradeForm, expiry_date: e.target.value})}
+                            onChange={(e) => {
+                              const newValue = e.target.value
+                              setUpgradeForm(prev => ({...prev, expiry_date: newValue}))
+                            }}
+                            autoComplete="cc-exp"
                             required={selectedPaymentMethod === 'card'}
                           />
                         </div>
@@ -3210,7 +3721,11 @@ function App() {
                             type="text" 
                             placeholder="123"
                             value={upgradeForm.cvv}
-                            onChange={(e) => setUpgradeForm({...upgradeForm, cvv: e.target.value})}
+                            onChange={(e) => {
+                              const newValue = e.target.value
+                              setUpgradeForm(prev => ({...prev, cvv: newValue}))
+                            }}
+                            autoComplete="cc-csc"
                             required={selectedPaymentMethod === 'card'}
                           />
                         </div>
@@ -3221,7 +3736,11 @@ function App() {
                           type="text" 
                           placeholder="Street address"
                           value={upgradeForm.billing_address}
-                          onChange={(e) => setUpgradeForm({...upgradeForm, billing_address: e.target.value})}
+                          onChange={(e) => {
+                            const newValue = e.target.value
+                            setUpgradeForm(prev => ({...prev, billing_address: newValue}))
+                          }}
+                          autoComplete="street-address"
                           required={selectedPaymentMethod === 'card'}
                         />
                       </div>
@@ -3231,7 +3750,11 @@ function App() {
                           <input 
                             type="text" 
                             value={upgradeForm.city}
-                            onChange={(e) => setUpgradeForm({...upgradeForm, city: e.target.value})}
+                            onChange={(e) => {
+                              const newValue = e.target.value
+                              setUpgradeForm(prev => ({...prev, city: newValue}))
+                            }}
+                            autoComplete="address-level2"
                             required={selectedPaymentMethod === 'card'}
                           />
                         </div>
@@ -3240,7 +3763,11 @@ function App() {
                           <input 
                             type="text" 
                             value={upgradeForm.zip_code}
-                            onChange={(e) => setUpgradeForm({...upgradeForm, zip_code: e.target.value})}
+                            onChange={(e) => {
+                              const newValue = e.target.value
+                              setUpgradeForm(prev => ({...prev, zip_code: newValue}))
+                            }}
+                            autoComplete="postal-code"
                             required={selectedPaymentMethod === 'card'}
                           />
                         </div>
@@ -3250,7 +3777,11 @@ function App() {
                         <input 
                           type="text" 
                           value={upgradeForm.country}
-                          onChange={(e) => setUpgradeForm({...upgradeForm, country: e.target.value})}
+                          onChange={(e) => {
+                            const newValue = e.target.value
+                            setUpgradeForm(prev => ({...prev, country: newValue}))
+                          }}
+                          autoComplete="country"
                           required={selectedPaymentMethod === 'card'}
                         />
                       </div>
@@ -3359,7 +3890,7 @@ function App() {
       <div className="usage-dashboard">
         <div className="usage-dashboard-header">
           <h3>Usage Dashboard</h3>
-          <button className="upgrade-btn-small" onClick={() => { setSettingsTab('overview'); fetchBillingInfo(); }}>
+          <button className="upgrade-btn-small" onClick={() => { setSettingsTab('overview'); fetchBillingInfo(false); }}>
             Upgrade Plan
           </button>
         </div>
@@ -4526,22 +5057,18 @@ function App() {
                 <span>Amount</span>
                 <span>Invoice</span>
               </div>
-              {(billingHistory || []).map(rec => (
-                <div key={rec.id || rec.invoice_id || rec.created_at} className="billing-row">
-                  <span>{rec.created_at ? new Date(rec.created_at).toLocaleDateString() : '-'}</span>
-                  <span>{rec.description || rec.model_name || 'Invoice'}</span>
-                  <span>{rec.status || 'Paid'}</span>
-                  <span>${(rec.amount_usd || rec.cost_usd || 0).toFixed(2)}</span>
+              {(invoices || []).map((inv, idx) => (
+                <div key={inv.id || inv.date || idx} className="billing-row">
+                  <span>{inv.date ? new Date(inv.date).toLocaleDateString() : (inv.period_end ? new Date(inv.period_end).toLocaleDateString() : '-')}</span>
+                  <span>{inv.models && inv.models.length > 0 ? inv.models.join(', ') : 'Monthly Invoice'}</span>
+                  <span>Paid</span>
+                  <span>${(inv.total_cost_usd || 0).toFixed(2)}</span>
                   <span>
-                    {rec.invoice_url ? (
-                      <a className="invoice-view-btn" href={rec.invoice_url} target="_blank" rel="noreferrer">View</a>
-                    ) : (
-                      <button className="invoice-view-btn" disabled>View</button>
-                    )}
+                    <button className="invoice-view-btn" disabled>View</button>
                   </span>
                 </div>
               ))}
-              {(billingHistory || []).length === 0 && (
+              {(invoices || []).length === 0 && (
                 <div className="billing-empty">No invoices yet.</div>
               )}
             </div>
@@ -4549,6 +5076,18 @@ function App() {
         </div>
       </>
     )
+  }
+
+  // If logged in but email not verified, show a verification page instead of the app
+  // Prefer authoritative `user.email_verified` when available to avoid showing the page
+  // for already-verified users (handles race conditions on profile fetch)
+  if (
+    isAuthenticated && (
+      (user && user.email_verified === false) ||
+      (!user && emailVerificationPending)
+    )
+  ) {
+    return <EmailVerificationPage />
   }
 
   if (!isAuthenticated) {
@@ -4576,13 +5115,23 @@ function App() {
               </button>
               <button
                 className={`settings-nav-item ${settingsTab === 'usage' ? 'active' : ''}`}
-                onClick={() => { setSettingsTab('usage'); fetchUsageSummary(); fetchBillingHistory(); }}
+                onClick={() => { 
+                  setSettingsTab('usage')
+                  // Lazy load: only fetch when tab is clicked
+                  fetchUsageSummary()
+                  fetchBillingHistory()
+                }}
               >
                 Usage
               </button>
               <button
                 className={`settings-nav-item ${settingsTab === 'billing' ? 'active' : ''}`}
-                onClick={() => { setSettingsTab('billing'); fetchBillingInfo(); fetchBillingHistory(); }}
+                onClick={() => { 
+                  setSettingsTab('billing')
+                  // Lazy load: only fetch when tab is clicked
+                  fetchBillingInfo(false)  // Don't fetch additional data
+                  fetchInvoices()  // Fetch invoices for billing tab
+                }}
               >
                 Billing & Invoices
               </button>
@@ -4666,7 +5215,7 @@ function App() {
           </div>
         </div>
         <div className="sidebar-footer">
-              <button className="sidebar-footer-item" onClick={() => { setSettingsTab('overview'); setShowSettings(true); fetchBillingInfo(); fetchUsageSummary(); fetchBillingHistory(); }}>
+              <button className="sidebar-footer-item" onClick={() => { setSettingsTab('overview'); setShowSettings(true); fetchBillingInfo(false); }}>
             ⚙️ Settings
           </button>
         </div>
@@ -4677,7 +5226,7 @@ function App() {
       <main className="chat-layout">
         <header className="chat-header">
           <div className="header-left">
-            <div className="chat-title">LLM Router Chat</div>
+            <div className="chat-title">Vector Chat</div>
             <div className="chat-subtitle">AI-powered conversation interface</div>
           </div>
           <div className="header-right">
@@ -4725,7 +5274,7 @@ function App() {
               <span className="warning-icon">⚠️</span>
               <span className="warning-message">{limitWarningMessage}</span>
               <div className="warning-actions">
-                <button className="btn-small btn-primary" onClick={() => { setShowSettings(true); setSettingsTab('billing'); fetchBillingInfo(); }}>
+                <button className="btn-small btn-primary" onClick={() => { setShowSettings(true); setSettingsTab('billing'); fetchBillingInfo(false); fetchInvoices(); }}>
                   Upgrade
                 </button>
                 <button className="btn-small btn-secondary" onClick={() => setShowLimitWarning(false)}>
@@ -4736,7 +5285,7 @@ function App() {
           )}
           {messages.length === 0 ? (
             <div className="empty-state">
-              <h3>Welcome to LLM Router! 👋</h3>
+              <h3>Vector! 👋</h3>
               <p>Start a conversation by typing a message below.</p>
               <div className="company-logos">
                 <img src={googleIcon} alt="Google" className="vendor-icon" />
@@ -5080,28 +5629,97 @@ function App() {
             </button>
           </div>
           <form className="chat-input-form" onSubmit={sendMessage}>
-            <textarea
-              ref={textareaRef}
-              className="chat-input"
-              placeholder="Send a message..."
-              rows={1}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  sendMessage(e)
-                }
-              }}
-            />
+            <div className="model-select-wrapper">
+              <select
+                className="model-select"
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                disabled={isLoading}
+              >
+                <option value="auto">Auto (Recommended)</option>
+                {availableModels.map((model) => (
+                  <option key={model.model_name} value={model.model_name}>
+                    {model.model_name} {model.cost_per_1M_tokens > 0 ? `($${model.cost_per_1M_tokens}/1M)` : '(Free)'}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="chat-input-container">
+              <textarea
+                ref={textareaRef}
+                className="chat-input"
+                placeholder="Send a message..."
+                rows={1}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    sendMessage(e)
+                  }
+                }}
+                onPaste={(e) => {
+                  const items = e.clipboardData.items
+                  for (let i = 0; i < items.length; i++) {
+                    if (items[i].type.indexOf('image') !== -1) {
+                      const file = items[i].getAsFile()
+                      handleImageUpload(file)
+                      e.preventDefault()
+                      break
+                    }
+                  }
+                }}
+              />
+              <input
+                type="file"
+                ref={fileInputRef}
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  if (e.target.files && e.target.files[0]) {
+                    handleImageUpload(e.target.files[0])
+                  }
+                }}
+              />
+              {uploadedImage && imagePreview ? (
+                <div className="image-attachment-icon" title="Image attached - click to remove">
+                  <img src={imagePreview} alt="Attached" className="image-attachment-thumbnail" />
+                  <button 
+                    type="button" 
+                    className="remove-image-icon-btn"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setUploadedImage(null)
+                      setImagePreview(null)
+                    }}
+                    title="Remove image"
+                  >
+                    ×
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="image-upload-btn"
+                  onClick={() => fileInputRef.current?.click()}
+                  title="Upload image"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                    <circle cx="8.5" cy="8.5" r="1.5"/>
+                    <polyline points="21 15 16 10 5 21"/>
+                  </svg>
+                </button>
+              )}
+            </div>
             {isLoading ? (
               <button type="button" className="send-btn stop-btn" onClick={cancelRequest}>⏹</button>
             ) : (
-              <button type="submit" className="send-btn" disabled={!input.trim()}>➤</button>
+              <button type="submit" className="send-btn" disabled={!input.trim() && !uploadedImage}>➤</button>
             )}
           </form>
           <p className="chat-input-helper">
-            LLM Router may produce inaccurate information about people, places, or facts.
+            Vector may produce inaccurate information about people, places, or facts.
           </p>
         </footer>
       </main>
